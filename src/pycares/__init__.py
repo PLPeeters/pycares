@@ -430,6 +430,20 @@ def parse_dnsrec(dnsrec):
     return result, None
 
 
+class _ChannelOperationTracker:
+    """Tracks native calls so a channel is destroyed only after they return."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.operations_done = threading.Condition(self.lock)
+        self.active_operations = 0
+
+    def wait_for_operations(self) -> None:
+        with self.operations_done:
+            while self.active_operations:
+                self.operations_done.wait()
+
+
 class _ChannelShutdownManager:
     """Manages channel destruction in a single background thread using SimpleQueue."""
 
@@ -442,7 +456,8 @@ class _ChannelShutdownManager:
         """Process channel destruction requests from the queue."""
         while True:
             # Block forever until we get a channel to destroy
-            ch, sock_state_cb_handle = self._queue.get()
+            ch, operation_tracker, sock_state_cb_handle = self._queue.get()
+            operation_tracker.wait_for_operations()
             channel = ch[0]
 
             # Cancel all pending queries - this will trigger callbacks with ARES_ECANCELLED
@@ -456,7 +471,7 @@ class _ChannelShutdownManager:
 
             # Keep the callback handle alive through native destruction, then
             # release this iteration's objects before blocking for more work.
-            del ch, channel, sock_state_cb_handle
+            del ch, channel, operation_tracker, sock_state_cb_handle
 
     def start(self) -> None:
         """Start the background thread if not already started."""
@@ -469,19 +484,19 @@ class _ChannelShutdownManager:
             self._thread = threading.Thread(target=self._run_safe_shutdown_loop, daemon=True)
             self._thread.start()
 
-    def destroy_channel(self, channel, sock_state_cb_handle) -> None:
+    def destroy_channel(self, channel, operation_tracker, sock_state_cb_handle) -> None:
         """
         Schedule channel destruction on the background thread.
 
-        The socket state callback handle is passed along to ensure it remains
-        alive until the channel is destroyed.
+        The operation tracker and socket state callback handle remain alive
+        until in-flight operations finish and the channel is destroyed.
 
         Thread Safety and Synchronization:
         This method uses SimpleQueue which is thread-safe for putting items
         from multiple threads. The background thread processes channels
         sequentially waiting for queries to end before each destruction.
         """
-        self._queue.put((channel, sock_state_cb_handle))
+        self._queue.put((channel, operation_tracker, sock_state_cb_handle))
 
 
 # Global shutdown manager instance
@@ -513,7 +528,8 @@ class Channel:
 
         # Initialize _channel to None first to ensure __del__ doesn't fail
         self._channel = None
-        self._lock = threading.RLock()
+        self._operation_tracker = _ChannelOperationTracker()
+        self._lock = self._operation_tracker.lock
 
         # Store flags for later use (default is 0 if not specified)
         self._flags = flags if flags is not None else 0
@@ -618,8 +634,10 @@ class Channel:
     @contextlib.contextmanager
     def _capture_channel(self):
         """
-        Yield the c-ares channel pointer while holding self._lock so that
-        a concurrent close() cannot destroy the channel mid-call.
+        Yield a c-ares channel pointer protected by an in-flight operation
+        lease, so close() cannot destroy the channel during the native call.
+        The Python lock is released while the caller uses the pointer, allowing
+        callback re-entry from another thread.
 
         Raises RuntimeError if the channel has been closed.
         """
@@ -627,7 +645,16 @@ class Channel:
             channel = self._channel
             if channel is None:
                 raise RuntimeError("Channel is destroyed, no new queries allowed")
+            self._operation_tracker.active_operations += 1
+
+        try:
             yield channel[0]
+        finally:
+            tracker = self._operation_tracker
+            with tracker.operations_done:
+                tracker.active_operations -= 1
+                if tracker.active_operations == 0:
+                    tracker.operations_done.notify_all()
 
     def _register_callback_handle(self, callback_data):
         """
@@ -951,7 +978,9 @@ class Channel:
         # query callback.
 
         # Schedule channel destruction
-        _shutdown_manager.destroy_channel(channel, self._sock_state_cb_handle)
+        _shutdown_manager.destroy_channel(
+            channel, self._operation_tracker, self._sock_state_cb_handle
+        )
 
     def wait(self, timeout: float=None) -> bool:
         """
