@@ -142,6 +142,8 @@ def _query_dnsrec_cb(arg, status, timeouts, dnsrec):
         return
 
     callback = _ffi.from_handle(arg)
+    if isinstance(callback, Operation):
+        callback = callback._take_callback()
 
     try:
         if status != _lib.ARES_SUCCESS:
@@ -164,6 +166,8 @@ def _addrinfo_cb(arg, status, timeouts, res):
         return
 
     callback = _ffi.from_handle(arg)
+    if isinstance(callback, Operation):
+        callback = callback._take_callback()
 
     try:
         if status != _lib.ARES_SUCCESS:
@@ -503,6 +507,50 @@ class _ChannelShutdownManager:
 _shutdown_manager = _ChannelShutdownManager()
 
 
+class Operation:
+    """A retained identity for one cancellable DNS operation.
+
+    Releasing this Python object does not cancel work. Terminal operations
+    may be kept and cancelled safely after their channel has closed.
+    """
+
+    def __init__(self, channel: "Channel", callback: Callable[[Any, int], None]):
+        self._lock = threading.Lock()
+        self._channel: Optional[Channel] = channel
+        self._callback: Optional[Callable[[Any, int], None]] = callback
+        release = _lib.ares_operation_release
+        self._token = _ffi.gc(
+            _ffi.new("ares_operation_t **"),
+            lambda pointer: release(pointer[0]),
+        )
+
+    def _take_callback(self) -> Callable[[Any, int], None]:
+        # Native terminal selection already happened. Shed callback/resolver
+        # references even if parsing or user delivery raises below.
+        with self._lock:
+            callback, self._callback = self._callback, None
+            self._channel = None
+        assert callback is not None
+        return callback
+
+    def cancel(self) -> None:
+        """Cancel this lookup only; a terminal operation is a no-op."""
+        with self._lock:
+            channel = self._channel
+        if channel is None:
+            return
+        with contextlib.ExitStack() as leases:
+            # Capture under the channel lock, then release that lock before
+            # native code can run callbacks. A queued close owns cancellation.
+            with channel._lock:
+                if channel._channel is None:
+                    return
+                pointer = leases.enter_context(channel._capture_channel())
+            status = _lib.ares_operation_cancel(pointer, self._token[0])
+        if status != _lib.ARES_SUCCESS:
+            raise AresError(status, errno.strerror(status))
+
+
 class Channel:
     __qtypes__ = (_lib.ARES_REC_TYPE_A, _lib.ARES_REC_TYPE_AAAA, _lib.ARES_REC_TYPE_ANY, _lib.ARES_REC_TYPE_CAA, _lib.ARES_REC_TYPE_CNAME, _lib.ARES_REC_TYPE_HTTPS, _lib.ARES_REC_TYPE_MX, _lib.ARES_REC_TYPE_NAPTR, _lib.ARES_REC_TYPE_NS, _lib.ARES_REC_TYPE_PTR, _lib.ARES_REC_TYPE_SOA, _lib.ARES_REC_TYPE_SRV, _lib.ARES_REC_TYPE_TLSA, _lib.ARES_REC_TYPE_TXT, _lib.ARES_REC_TYPE_URI)
     __qclasses__ = (_lib.ARES_CLASS_IN, _lib.ARES_CLASS_CHAOS, _lib.ARES_CLASS_HESOID, _lib.ARES_CLASS_NONE, _lib.ARES_CLASS_ANY)
@@ -667,6 +715,22 @@ class Channel:
         _handle_to_channel[userdata] = self
         return userdata
 
+    def _submit_cancellable(self, channel, callback, submit, args, native_callback):
+        operation = Operation(self, callback)
+        userdata = self._register_callback_handle(operation)
+        try:
+            status = submit(channel, *args, native_callback, userdata, operation._token)
+        except BaseException:
+            # Native acceptance publishes the token before callback eligibility.
+            # Once published, only terminal cleanup may release this handle.
+            if operation._token[0] == _ffi.NULL:
+                _handle_to_channel.pop(userdata, None)
+            raise
+        if status != _lib.ARES_SUCCESS:
+            _handle_to_channel.pop(userdata, None)
+            raise AresError(status, errno.strerror(status))
+        return operation
+
     def cancel(self) -> None:
         with self._capture_channel() as channel:
             _lib.ares_cancel(channel)
@@ -768,6 +832,19 @@ class Channel:
         flags: int = 0,
         callback: Callable[[Any, int], None]
     ) -> None:
+        self._getaddrinfo(host, port, family, type, proto, flags, callback, False)
+
+    def getaddrinfo_cancellable(
+        self, host: str, port: Optional[int], *, family: socket.AddressFamily = 0,
+        type: int = 0, proto: int = 0, flags: int = 0,
+        callback: Callable[[Any, int], None],
+    ) -> Operation:
+        """Submit an address lookup owning all families and search candidates."""
+        operation = self._getaddrinfo(host, port, family, type, proto, flags, callback, True)
+        assert operation is not None
+        return operation
+
+    def _getaddrinfo(self, host, port, family, type, proto, flags, callback, cancellable):
         if not callable(callback):
             raise TypeError("a callable is required")
 
@@ -779,14 +856,20 @@ class Channel:
             service = ascii_bytes(port)
 
         with self._capture_channel() as channel:
+            hints = _ffi.new('struct ares_addrinfo_hints*')
+            hints.ai_flags = flags
+            hints.ai_family = family
+            hints.ai_socktype = type
+            hints.ai_protocol = proto
+            host = parse_name(host)
+            if cancellable:
+                return self._submit_cancellable(
+                    channel, callback, _lib.ares_getaddrinfo_cancellable,
+                    (host, service, hints), _lib._addrinfo_cb,
+                )
             userdata = self._register_callback_handle(callback)
             try:
-                hints = _ffi.new('struct ares_addrinfo_hints*')
-                hints.ai_flags = flags
-                hints.ai_family = family
-                hints.ai_socktype = type
-                hints.ai_protocol = proto
-                _lib.ares_getaddrinfo(channel, parse_name(host), service, hints, _lib._addrinfo_cb, userdata)
+                _lib.ares_getaddrinfo(channel, host, service, hints, _lib._addrinfo_cb, userdata)
             except BaseException:
                 _handle_to_channel.pop(userdata, None)
                 raise
@@ -803,6 +886,15 @@ class Channel:
 
         The callback will receive a DNSResult object containing answer, authority, and additional sections.
         """
+        self._query(name, query_type, query_class, callback, False)
+
+    def query_cancellable(self, name: str, query_type: int, *, query_class: int = QUERY_CLASS_IN, callback: Callable[[Any, int], None]) -> Operation:
+        """Submit a DNS query and return its retained cancellation identity."""
+        operation = self._query(name, query_type, query_class, callback, True)
+        assert operation is not None
+        return operation
+
+    def _query(self, name, query_type, query_class, callback, cancellable):
         if not callable(callback):
             raise TypeError('a callable is required')
 
@@ -813,12 +905,18 @@ class Channel:
             raise ValueError('invalid query class specified')
 
         with self._capture_channel() as channel:
+            name = parse_name(name)
+            if cancellable:
+                return self._submit_cancellable(
+                    channel, callback, _lib.ares_query_dnsrec_cancellable,
+                    (name, query_class, query_type), _lib._query_dnsrec_cb,
+                )
             userdata = self._register_callback_handle(callback)
             try:
                 qid = _ffi.new("unsigned short *")
                 status = _lib.ares_query_dnsrec(
                     channel,
-                    parse_name(name),
+                    name,
                     query_class,
                     query_type,
                     _lib._query_dnsrec_cb,
@@ -844,6 +942,15 @@ class Channel:
 
         The callback will receive a DNSResult object containing answer, authority, and additional sections.
         """
+        self._search(name, query_type, query_class, callback, False)
+
+    def search_cancellable(self, name: str, query_type: int, *, query_class: int = QUERY_CLASS_IN, callback: Callable[[Any, int], None]) -> Operation:
+        """Submit a DNS search owning every candidate and transport retry."""
+        operation = self._search(name, query_type, query_class, callback, True)
+        assert operation is not None
+        return operation
+
+    def _search(self, name, query_type, query_class, callback, cancellable):
         if not callable(callback):
             raise TypeError('a callable is required')
 
@@ -852,6 +959,8 @@ class Channel:
 
         if query_class not in self.__qclasses__:
             raise ValueError('invalid query class specified')
+
+        name = parse_name(name)
 
         # Create a DNS record for the search query
         # Set RD (Recursion Desired) flag unless ARES_FLAG_NORECURSE is set
@@ -870,21 +979,19 @@ class Channel:
 
         dnsrec = dnsrec_p[0]
 
-        # Add the query to the DNS record
-        status = _lib.ares_dns_record_query_add(
-            dnsrec,
-            parse_name(name),
-            query_type,
-            query_class
-        )
-        if status != _lib.ARES_SUCCESS:
-            _lib.ares_dns_record_destroy(dnsrec)
-            raise AresError(status, errno.strerror(status))
-
-        # dnsrec is only needed for this call (it's a const parameter); free
-        # it once ares_search_dnsrec() returns, regardless of outcome.
+        # Free the record even if CFFI argument conversion or submission raises.
         try:
+            status = _lib.ares_dns_record_query_add(
+                dnsrec, name, query_type, query_class
+            )
+            if status != _lib.ARES_SUCCESS:
+                raise AresError(status, errno.strerror(status))
             with self._capture_channel() as channel:
+                if cancellable:
+                    return self._submit_cancellable(
+                        channel, callback, _lib.ares_search_dnsrec_cancellable,
+                        (dnsrec,), _lib._query_dnsrec_cb,
+                    )
                 userdata = self._register_callback_handle(callback)
                 try:
                     status = _lib.ares_search_dnsrec(

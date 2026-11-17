@@ -112,6 +112,23 @@ This module can be used directly from the command line in a similar fashion to d
    google.com		600	IN	MX	30 alt2.aspmx.l.google.com
 
 
+Individual query cancellation
+-----------------------------
+
+``Channel.query_cancellable()``, ``search_cancellable()``, and
+``getaddrinfo_cancellable()`` return an ``Operation`` with a ``cancel()`` method.
+Cancellation affects that lookup only and delivers one terminal callback with
+``ARES_ECANCELLED`` when cancellation wins. Existing callback methods still
+return ``None``. See ``docs/channel.rst`` for lifetime and transport details.
+
+The bundled c-ares includes the required native cancellation extension.
+``PYCARES_USE_SYSTEM_LIB=1`` requires headers and a library implementing that
+extension; an unmodified c-ares 1.34.9 does not suffice. Unsupported system
+libraries fail the build with an actionable error. Unset that environment
+variable to use the bundled implementation. Cancellation is never emulated by
+canceling every query on a channel.
+
+
 Author
 ------
 

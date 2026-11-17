@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from setuptools import setup
 from setuptools.command.build_ext import build_ext
+from setuptools.errors import CompileError, LinkError
 
 
 use_system_lib = bool(int(os.environ.get('PYCARES_USE_SYSTEM_LIB', 0)))
@@ -21,10 +24,51 @@ class cares_build_ext(build_ext):
             dirs.insert(0, dir)
         self.compiler.set_include_dirs(dirs)
 
+    def check_cancellation_extension(self):
+        # A version number cannot identify this additive native extension.
+        # Compile and link every required entry point; never emulate cancellation.
+        source = """
+#include <ares.h>
+int main(void) {
+    ares_operation_t *operation = 0;
+    ares_query_dnsrec_cancellable(0, "", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                                  0, 0, &operation);
+    ares_search_dnsrec_cancellable(0, 0, 0, 0, &operation);
+    ares_getaddrinfo_cancellable(0, "", 0, 0, 0, 0, &operation);
+    ares_operation_cancel(0, operation);
+    ares_operation_release(operation);
+    return 0;
+}
+"""
+        os.makedirs(self.build_temp, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=self.build_temp) as directory:
+            probe = os.path.join(directory, 'cancellation.c')
+            with open(probe, 'w') as output:
+                output.write(source)
+            try:
+                objects = self.compiler.compile([probe], output_dir=directory)
+                # setuptools applies LDFLAGS to extension linking, but not its
+                # executable linker. Probe the same supplied library paths.
+                link_args = shlex.split(os.environ.get('LDFLAGS', ''))
+                self.compiler.link_executable(
+                    objects, os.path.join(directory, 'cancellation'),
+                    extra_preargs=link_args,
+                )
+            except (CompileError, LinkError) as error:
+                raise RuntimeError(
+                    "System c-ares must provide the native per-operation cancellation extension "
+                    "(ares_query_dnsrec_cancellable, ares_search_dnsrec_cancellable, "
+                    "ares_getaddrinfo_cancellable, ares_operation_cancel/release). "
+                    "Use the bundled library by unsetting PYCARES_USE_SYSTEM_LIB, or supply "
+                    "headers and a library implementing this extension; c-ares 1.34.9 alone "
+                    "does not provide it."
+                ) from error
+
     def build_extensions(self):
         # Use system c-ares library if requested
         if use_system_lib:
             self.compiler.add_library('cares')
+            self.check_cancellation_extension()
             build_ext.build_extensions(self)
             return
 

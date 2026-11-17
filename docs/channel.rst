@@ -326,6 +326,28 @@
         This function does the same as :py:meth:`query` but it will honor the ``domain`` and ``search`` directives in
         ``resolv.conf``. The callback signature and return types are identical to :py:meth:`query`.
 
+    .. py:method:: query_cancellable(name, query_type, *, query_class=QUERY_CLASS_IN, callback)
+
+        Submit the same query as :py:meth:`query`, returning an :py:class:`Operation`.
+
+    .. py:method:: search_cancellable(name, query_type, *, query_class=QUERY_CLASS_IN, callback)
+
+        Submit the same search as :py:meth:`search`, returning one :py:class:`Operation`
+        owning every search candidate and its retries.
+
+    .. py:method:: getaddrinfo_cancellable(host, port, *, family=0, type=0, proto=0, flags=0, callback)
+
+        Submit the same lookup as :py:meth:`getaddrinfo`, returning one
+        :py:class:`Operation` owning all A/AAAA requests, search candidates, retries,
+        and transport fallback work. Cancellation discards partial address results.
+
+    The existing ``query``, ``search``, and ``getaddrinfo`` methods continue returning
+    ``None``. Both forms preserve the ``callback(result, error)`` signature and
+    result types. The cancellable forms deliver errors after native acceptance
+    through exactly one terminal callback, including ``(None, ARES_ECANCELLED)``
+    when cancellation wins. Errors before acceptance raise without a callback.
+    Callbacks can run synchronously, before the submission method returns.
+
     .. py:method:: cancel()
 
         Cancel any pending query on this channel. All pending callbacks will be called with ARES_ECANCELLED errorno.
@@ -335,8 +357,7 @@
         Close the channel as soon as it's safe to do so.
 
         This method can be called from any thread. The channel will be destroyed
-        safely using a background thread with a 1-second delay to ensure c-ares
-        has completed its cleanup.
+        safely using a background thread after in-flight native calls return.
 
         Once close() is called, no new queries can be started. Any pending
         queries will be cancelled and their callbacks will receive ARES_ECANCELLED.
@@ -401,3 +422,31 @@
     .. py:attribute:: servers
 
         List of nameservers to use for DNS queries.
+
+
+.. py:class:: Operation
+
+    Returned by the cancellable submission methods. Keeping this object retains
+    its native identity, independently of channel lifetime. Dropping it does not
+    cancel pending work: pycares retains callback handles until terminal cleanup,
+    including when a callback raises. A completed operation sheds its callback
+    and channel references.
+
+    .. py:method:: cancel()
+
+        Cancel only this operation and return ``None``. Unrelated work on the
+        channel continues normally. Repeated cancellation and cancellation
+        after terminal completion are safe no-ops, including after channel
+        destruction. The callback may run before ``cancel()`` returns.
+
+        Calls are safe across threads and from callbacks. If ``Channel.close()``
+        already queued shutdown, cancellation leaves terminal notification to
+        that shutdown. Callback state stays alive through callback return;
+        ``cancel()`` does not wait for an already selected callback to return.
+
+        Cancellation removes wholly unsent owned output and stops logical
+        retries. A partially written TCP frame may finish to preserve shared
+        connection framing, and transmitted packets cannot be retracted.
+        Existing DNS response matching remains unchanged: after wire-ID reuse,
+        a delayed reply may satisfy an identical replacement query.
+

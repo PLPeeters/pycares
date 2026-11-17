@@ -227,6 +227,7 @@ typedef enum {
 /* Opaque DNS record structures */
 typedef struct ares_dns_record ares_dns_record_t;
 typedef struct ares_dns_rr ares_dns_rr_t;
+typedef struct ares_operation ares_operation_t;
 
 typedef int... ares_socket_t;
 typedef int... ares_socklen_t;
@@ -596,6 +597,22 @@ ares_status_t ares_query_dnsrec(ares_channel channel,
                                 ares_callback_dnsrec callback,
                                 void *arg,
                                 unsigned short *qid);
+
+/* Retained native per-operation cancellation extension. */
+ares_status_t ares_query_dnsrec_cancellable(
+    ares_channel channel, const char *name, ares_dns_class_t dnsclass,
+    ares_dns_rec_type_t type, ares_callback_dnsrec callback, void *arg,
+    ares_operation_t **operation);
+ares_status_t ares_getaddrinfo_cancellable(
+    ares_channel channel, const char *node, const char *service,
+    const struct ares_addrinfo_hints *hints, ares_addrinfo_callback callback,
+    void *arg, ares_operation_t **operation);
+ares_status_t ares_search_dnsrec_cancellable(
+    ares_channel channel, const ares_dns_record_t *dnsrec,
+    ares_callback_dnsrec callback, void *arg, ares_operation_t **operation);
+ares_status_t ares_operation_cancel(ares_channel channel,
+                                    ares_operation_t *operation);
+void ares_operation_release(ares_operation_t *operation);
 
 ares_status_t ares_search_dnsrec(ares_channel channel,
                                  const ares_dns_record_t *dnsrec,
